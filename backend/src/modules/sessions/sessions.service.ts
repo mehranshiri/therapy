@@ -6,6 +6,7 @@ import { SessionEntry } from './entities/session-entry.entity';
 import { CreateSessionDto } from './dto/create-session.dto';
 import { AddEntryDto } from './dto/add-entry.dto';
 import { AiService } from '../ai/ai.service';
+import { RAGService } from '../rag/rag.service';
 
 @Injectable()
 export class SessionsService {
@@ -15,6 +16,7 @@ export class SessionsService {
     @InjectRepository(SessionEntry)
     private entriesRepository: Repository<SessionEntry>,
     private aiService: AiService,
+    private ragService: RAGService,
   ) {}
 
   async create(createSessionDto: CreateSessionDto): Promise<Session> {
@@ -84,7 +86,7 @@ export class SessionsService {
     // Generate or update summary
     const summary = await this.aiService.generateSummary(session.entries);
     
-    // Generate embedding from summary
+    // Generate embedding from summary (keep for backward compatibility)
     const embedding = await this.aiService.generateEmbedding(summary);
     
     // Update session
@@ -92,6 +94,25 @@ export class SessionsService {
       summary,
       embedding,
     });
+
+    // Index the content using RAG for chunk-level search
+    // Build text from entries or use transcript if available
+    const textToIndex = session.transcript || 
+      session.entries.map(e => `${e.speaker}: ${e.content}`).join('\n');
+    
+    if (textToIndex && textToIndex.trim()) {
+      try {
+        await this.ragService.indexDocument(textToIndex, {
+          sessionId: session.id,
+          therapistId: session.therapistId,
+          clientId: session.clientId,
+          timestamp: session.startTime,
+        });
+      } catch (error) {
+        console.error('Failed to index document in RAG system:', error);
+        // Don't fail the whole operation if RAG indexing fails
+      }
+    }
   }
 
   async generateSummary(sessionId: string): Promise<string> {

@@ -1,12 +1,14 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
 import { SessionsService } from '../sessions/sessions.service';
 import { AiService } from '../ai/ai.service';
+import { RAGService } from '../rag/rag.service';
 
 @Injectable()
 export class TranscriptionService {
   constructor(
     private sessionsService: SessionsService,
     private aiService: AiService,
+    private ragService: RAGService,
   ) {}
 
   /**
@@ -58,6 +60,7 @@ export class TranscriptionService {
 
   /**
    * Generate embedding for session and store it
+   * Uses RAGService.indexDocument to chunk and index the full transcript
    */
   async generateAndStoreEmbedding(sessionId: string): Promise<void> {
     const session = await this.sessionsService.findOne(sessionId);
@@ -65,19 +68,37 @@ export class TranscriptionService {
       throw new NotFoundException('Session not found');
     }
 
-    // Generate summary if not exists
+    // Generate summary if not exists (still needed for session entity)
     let summaryText = session.summary;
     if (!summaryText) {
       summaryText = await this.sessionsService.generateSummary(sessionId);
     }
 
-    // Generate embedding from summary
+    // Generate embedding from summary (keep for backward compatibility)
     const embedding = await this.aiService.generateEmbedding(summaryText);
 
-    // Store embedding in session
+    // Store embedding in session (for backward compatibility)
     await this.sessionsService.updateSession(sessionId, {
       embedding,
     });
+
+    // Index the full transcript using RAG for chunk-level search
+    // Use transcript if available, otherwise use summary
+    const textToIndex = session.transcript || summaryText;
+    
+    if (textToIndex && textToIndex.trim()) {
+      try {
+        await this.ragService.indexDocument(textToIndex, {
+          sessionId: session.id,
+          therapistId: session.therapistId,
+          clientId: session.clientId,
+          timestamp: session.startTime,
+        });
+      } catch (error) {
+        console.error('Failed to index document in RAG system:', error);
+        // Don't fail the whole operation if RAG indexing fails
+      }
+    }
   }
 }
 
