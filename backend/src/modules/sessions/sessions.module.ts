@@ -5,9 +5,10 @@ import { SessionsService } from './sessions.service';
 import { Session } from './entities/session.entity';
 import { SessionEntry } from './entities/session-entry.entity';
 import { AiModule } from '../ai/ai.module';
+import { RAGModule } from '../rag/rag.module';
 
 @Module({
-  imports: [TypeOrmModule.forFeature([Session, SessionEntry]), AiModule],
+  imports: [TypeOrmModule.forFeature([Session, SessionEntry]), AiModule, RAGModule],
   controllers: [SessionsController],
   providers: [SessionsService],
   exports: [SessionsService],

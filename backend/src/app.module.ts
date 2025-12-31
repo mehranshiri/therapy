@@ -5,6 +5,7 @@ import { SessionsModule } from './modules/sessions/sessions.module';
 import { TranscriptionModule } from './modules/transcription/transcription.module';
 import { SearchModule } from './modules/search/search.module';
 import { AiModule } from './modules/ai/ai.module';
+import { RAGModule } from './modules/rag/rag.module';
 
 @Module({
   imports: [
@@ -22,6 +23,7 @@ import { AiModule } from './modules/ai/ai.module';
     TranscriptionModule,
     SearchModule,
     AiModule,
+    RAGModule,
   ],
 })
 export class AppModule {}

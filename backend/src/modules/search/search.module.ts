@@ -4,9 +4,10 @@ import { SearchController } from './search.controller';
 import { SearchService } from './search.service';
 import { Session } from '../sessions/entities/session.entity';
 import { AiModule } from '../ai/ai.module';
+import { RAGModule } from '../rag/rag.module';
 
 @Module({
-  imports: [TypeOrmModule.forFeature([Session]), AiModule],
+  imports: [TypeOrmModule.forFeature([Session]), AiModule, RAGModule],
   controllers: [SearchController],
   providers: [SearchService],
 })

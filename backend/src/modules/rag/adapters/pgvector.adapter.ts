@@ -10,10 +10,7 @@ import { Repository } from 'typeorm';
 import { Session } from '../../sessions/entities/session.entity';
 
 /**
- * PostgreSQL pgvector Adapter (Repository Pattern Implementation)
- * Production-ready vector storage with PostgreSQL
- * 
- * Setup: CREATE EXTENSION IF NOT EXISTS vector;
+ * PostgreSQL pgvector Adapter
  */
 @Injectable()
 export class PgVectorAdapter implements IVectorStore {
@@ -29,7 +26,7 @@ export class PgVectorAdapter implements IVectorStore {
     //   [document.id, document.embedding, document.text, document.metadata]
     // );
 
-    // For SQLite compatibility (current implementation)
+    // For SQLite compatibility
     const session = await this.sessionsRepository.findOne({
       where: { id: document.metadata.sessionId },
     });
@@ -106,11 +103,10 @@ export class PgVectorAdapter implements IVectorStore {
   }
 
   async deleteByMetadata(filter: Partial<VectorMetadata>): Promise<void> {
-    // Build type-safe query using QueryBuilder
     let query = this.sessionsRepository
       .createQueryBuilder()
       .update(Session)
-      .set({ embedding: null as any }); // TypeORM allows null for nullable fields
+      .set({ embedding: null as any });
 
     // Apply filters conditionally
     if (filter.therapistId) {
