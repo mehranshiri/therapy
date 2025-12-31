@@ -135,7 +135,7 @@ export class RAGService {
     const {
       limit = 10,
       therapistId,
-      useHybrid = true,
+      useHybrid = false, // Default to false until keyword search is implemented
       useReranking = true,
       diversityMode = false,
     } = options;

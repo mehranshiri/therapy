@@ -23,11 +23,11 @@ export class SearchService {
     therapistId?: string,
     limit: number = 10,
   ) {
-    // Use RAGService for advanced search (hybrid search + reranking)
+    // Use RAGService for advanced search (semantic search + reranking)
     const ragResults = await this.ragService.search(query, {
       limit: limit * 2, // Get more results to account for multiple chunks per session
       therapistId,
-      useHybrid: true,
+      useHybrid: false, // Pure vector search (faster, simpler)
       useReranking: true,
     });
 
@@ -87,9 +87,12 @@ export class SearchService {
     }
 
     // Convert to array, sort by similarity, and limit
+    // Filter out results with no matched snippets
+    // Note: Similarity threshold removed for mock embeddings (random vectors have low similarity)
+    // In production with real embeddings, add: .filter((r) => r.similarity > 0.3)
     const results = Array.from(sessionMap.values())
       .filter((r) => r.matchedSnippets.length > 0) // Only return sessions with matches
-      .sort((a, b) => b.similarity - a.similarity)
+      .sort((a, b) => b.similarity - a.similarity) // Sort by similarity (even if low)
       .slice(0, limit);
 
     return results;

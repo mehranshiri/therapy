@@ -9,6 +9,11 @@ import { SearchResult } from '../../interfaces/vector-store.interface';
 @Injectable()
 export class CrossEncoderReranker {
   /**
+   * Minimum relevance threshold (0.0 to 1.0)
+   */
+  private readonly MIN_RELEVANCE_THRESHOLD = 0.1;
+
+  /**
    * Rerank search results using cross-encoder
    * @param query Original search query
    * @param results Initial search results
@@ -33,33 +38,91 @@ export class CrossEncoderReranker {
     // Sort by relevance score
     scoredResults.sort((a, b) => b.score - a.score);
 
-    return scoredResults.slice(0, topK);
+    // Apply relevance threshold: filter out results below minimum threshold
+    const topScore = scoredResults[0]?.score || 0;
+    const relativeThreshold = topScore > 0.2 ? topScore * 0.5 : this.MIN_RELEVANCE_THRESHOLD;
+    const finalThreshold = Math.max(this.MIN_RELEVANCE_THRESHOLD, relativeThreshold);
+
+    const relevantResults = scoredResults.filter((r) => r.score >= finalThreshold);
+
+    return relevantResults.slice(0, topK);
   }
 
   /**
    * Compute relevance score between query and document
    * In production, use: sentence-transformers/cross-encoder models
-   * For mock: use simple text overlap heuristic
+   * For mock: use word overlap heuristic with normalization
+   * 
+   * @param query Search query text
+   * @param document Document text to score
+   * @returns Relevance score between 0 and 1 (1 = perfect match)
    */
   private async computeRelevance(
     query: string,
     document: string,
   ): Promise<number> {
-    // Mock implementation using word overlap
-    const queryWords = new Set(
-      query.toLowerCase().split(/\s+/).filter((w) => w.length > 3),
+    // Early return for empty inputs
+    if (!query?.trim() || !document?.trim()) {
+      return 0;
+    }
+
+    // Extract and normalize words from query and document
+    const queryWords = this.extractSignificantWords(query);
+    const documentWords = this.extractSignificantWords(document);
+
+    // Early return if no significant words in query
+    if (queryWords.size === 0) {
+      return 0;
+    }
+
+    // Count word matches
+    const matchCount = Array.from(documentWords).filter((word) =>
+      queryWords.has(word),
+    ).length;
+
+    // Normalize by query word count (precision: how many query words matched)
+    const precision = matchCount / queryWords.size;
+
+    // Also consider recall (how many document words matched query)
+    // This helps when document is very long
+    const recall = matchCount / Math.max(documentWords.size, 1);
+
+    // F1 score: harmonic mean of precision and recall
+    // Balances both metrics for better relevance scoring
+    if (precision === 0 && recall === 0) {
+      return 0;
+    }
+
+    const f1Score = (2 * precision * recall) / (precision + recall);
+
+    return f1Score;
+  }
+
+  /**
+   * Extract significant words from text
+   * Filters out short words and common stop words
+   * 
+   * @param text Input text
+   * @returns Set of normalized significant words
+   */
+  private extractSignificantWords(text: string): Set<string> {
+    const MIN_WORD_LENGTH = 3;
+    const STOP_WORDS = new Set([
+      'the', 'and', 'for', 'with', 'this', 'that', 'from', 'have', 'been',
+      'were', 'was', 'are', 'you', 'your', 'can', 'will', 'would', 'should',
+      'could', 'may', 'might', 'must', 'shall', 'the', 'a', 'an', 'as',
+    ]);
+
+    return new Set(
+      text
+        .toLowerCase()
+        .split(/\s+/)
+        .map((word) => word.replace(/[^\w]/g, '')) // Remove punctuation
+        .filter(
+          (word) =>
+            word.length >= MIN_WORD_LENGTH && !STOP_WORDS.has(word),
+        ),
     );
-    const docWords = document.toLowerCase().split(/\s+/);
-
-    let matchCount = 0;
-    docWords.forEach((word) => {
-      if (word.length > 3 && queryWords.has(word)) {
-        matchCount++;
-      }
-    });
-
-    // Normalize by query length
-    return matchCount / Math.max(queryWords.size, 1);
   }
 
   /**

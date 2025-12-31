@@ -50,6 +50,7 @@ export class PgVectorAdapter implements IVectorStore {
     // SELECT id, text, metadata, 1 - (embedding <=> $1) as score
     // FROM vectors
     // WHERE metadata @> $2
+    //   AND 1 - (embedding <=> $1) > 0.3  -- Minimum similarity threshold
     // ORDER BY embedding <=> $1
     // LIMIT $3
 
@@ -64,6 +65,7 @@ export class PgVectorAdapter implements IVectorStore {
 
     const sessions = await query
       .andWhere('session.embedding IS NOT NULL')
+      .leftJoinAndSelect('session.entries', 'entries')
       .getMany();
 
     const results = sessions
@@ -73,10 +75,24 @@ export class PgVectorAdapter implements IVectorStore {
           session.embedding!,
         );
 
+        // Build searchable text from entries (most relevant), transcript, or summary
+        // Entries contain the actual conversation content that was indexed
+        let searchableText = '';
+        if (session.entries && session.entries.length > 0) {
+          // Use entries content (this is what was actually indexed)
+          searchableText = session.entries
+            .map((entry) => `${entry.speaker}: ${entry.content}`)
+            .join('\n');
+        } else if (session.transcript) {
+          searchableText = session.transcript;
+        } else if (session.summary) {
+          searchableText = session.summary;
+        }
+
         return {
           id: session.id,
           score: similarity,
-          text: session.summary || session.transcript || '',
+          text: searchableText,
           metadata: {
             sessionId: session.id,
             therapistId: session.therapistId,
@@ -85,10 +101,12 @@ export class PgVectorAdapter implements IVectorStore {
           },
         };
       })
-      .sort((a, b) => b.score - a.score)
-      .slice(0, limit);
+      .sort((a, b) => b.score - a.score);
 
-    return results;
+    // For mock embeddings, similarity scores are very low (near 0) but still provide ranking
+    // Quality filtering is handled by the reranker which uses word overlap (more reliable)
+    // Return top N results - let reranker filter out truly irrelevant results
+    return results.slice(0, limit);
   }
 
   async delete(id: string): Promise<void> {
