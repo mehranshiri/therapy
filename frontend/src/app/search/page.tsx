@@ -14,7 +14,12 @@ interface SearchResult {
     createdAt: string;
   };
   similarity: number;
-  matchedSnippets?: string[];
+  matchedSnippets?: Array<{
+    text: string;
+    highlighted: string;
+    score: number;
+    chunkIndex?: number | null;
+  }>;
 }
 
 export default function SearchPage() {
@@ -142,9 +147,18 @@ export default function SearchPage() {
                     {result.matchedSnippets.map((snippet, index) => (
                       <div
                         key={index}
-                        className="text-sm text-gray-600 bg-yellow-50 p-2 rounded"
+                        className="text-sm text-gray-700 bg-yellow-50 p-2 rounded border border-yellow-100"
                       >
-                        "{snippet.trim()}"
+                        <div
+                          className="leading-relaxed"
+                          dangerouslySetInnerHTML={{ __html: snippet.highlighted || snippet.text }}
+                        />
+                        <div className="mt-1 flex items-center text-xs text-gray-500">
+                          {snippet.chunkIndex !== null && snippet.chunkIndex !== undefined && (
+                            <span className="mr-3">Chunk #{snippet.chunkIndex + 1}</span>
+                          )}
+                          <span>Score: {(snippet.score * 100).toFixed(1)}%</span>
+                        </div>
                       </div>
                     ))}
                   </div>
@@ -172,10 +186,10 @@ export default function SearchPage() {
       <div className="mt-8 p-4 bg-blue-50 rounded-lg">
         <h4 className="font-semibold text-blue-900 mb-2">How It Works</h4>
         <ul className="text-sm text-blue-700 space-y-1 list-disc list-inside">
-          <li>Sessions must have embeddings generated (via transcription or summary)</li>
-          <li>Search uses cosine similarity between query and session embeddings</li>
-          <li>Mock mode generates random embeddings for demonstration</li>
-          <li>With OpenAI API, uses text-embedding-ada-002 for real semantic search</li>
+          <li>Sessions are chunked and embedded with OpenAI `text-embedding-3-large` (contextualized chunks)</li>
+          <li>Search is hybrid: semantic vectors + keyword/BM25, then reranked</li>
+          <li>Results include highlighted snippets from matching chunks (with scores)</li>
+          <li>Reranker uses OpenAI (or Cohere if provided); similarity threshold filters noise</li>
         </ul>
       </div>
     </div>

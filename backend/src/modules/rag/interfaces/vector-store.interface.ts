@@ -8,8 +8,10 @@ export interface VectorMetadata {
   therapistId: string;
   clientId: string;
   timestamp: string;
+  sessionIds?: string[]; // for filtering a set of sessions
   chunkIndex?: number;
   totalChunks?: number;
+  contextSummary?: string | null;
   [key: string]: any;
 }
 
@@ -45,6 +47,7 @@ export interface IVectorStore {
     queryEmbedding: number[],
     limit: number,
     filter?: Partial<VectorMetadata>,
+    minSimilarity?: number,
   ): Promise<SearchResult[]>;
 
   /**

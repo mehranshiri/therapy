@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { ConfigModule } from '@nestjs/config';
 import { Session } from '../sessions/entities/session.entity';
+import { SessionChunk } from './entities/session-chunk.entity';
 
 // Service
 import { RAGService } from './rag.service';
@@ -30,7 +31,7 @@ import { CrossEncoderReranker } from './strategies/reranking/cross-encoder-reran
  * - Extensible and testable architecture
  */
 @Module({
-  imports: [TypeOrmModule.forFeature([Session]), ConfigModule],
+  imports: [TypeOrmModule.forFeature([Session, SessionChunk]), ConfigModule],
   providers: [
     RAGService,
     

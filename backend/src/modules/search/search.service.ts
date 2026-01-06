@@ -27,8 +27,9 @@ export class SearchService {
     const ragResults = await this.ragService.search(query, {
       limit: limit * 2, // Get more results to account for multiple chunks per session
       therapistId,
-      useHybrid: false, // Pure vector search (faster, simpler)
-      useReranking: true,
+      useHybrid: true, // enable hybrid (semantic + keyword/BM25)
+      useReranking: true, // enabled: OpenAI reranker available
+      minSimilarity: 0.3,
     });
 
     // Extract unique session IDs
@@ -63,7 +64,12 @@ export class SearchService {
             createdAt: session.createdAt,
           },
           similarity: 0,
-          matchedSnippets: [] as string[],
+          matchedSnippets: [] as {
+            text: string;
+            highlighted: string;
+            score: number;
+            chunkIndex?: number | null;
+          }[],
         },
       ]),
     );
@@ -77,7 +83,12 @@ export class SearchService {
       
       // Add snippet if we don't have too many
       if (entry.matchedSnippets.length < 3) {
-        entry.matchedSnippets.push(result.text);
+        entry.matchedSnippets.push({
+          text: result.text,
+          highlighted: this.highlightText(result.text, query),
+          score: result.score ?? 0,
+          chunkIndex: result.metadata?.chunkIndex ?? null,
+        });
       }
       
       // Update similarity to highest score from this session
@@ -96,6 +107,22 @@ export class SearchService {
       .slice(0, limit);
 
     return results;
+  }
+
+  /**
+   * Simple query highlighter: wraps matched terms in <mark>.
+   */
+  private highlightText(text: string, query: string): string {
+    if (!text || !query) return text;
+    const terms = query
+      .split(/\s+/)
+      .map((t) => t.trim())
+      .filter((t) => t.length > 2);
+    if (terms.length === 0) return text;
+
+    const escaped = terms.map((t) => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+    const regex = new RegExp(`(${escaped.join('|')})`, 'gi');
+    return text.replace(regex, '<mark>$1</mark>');
   }
 }
 

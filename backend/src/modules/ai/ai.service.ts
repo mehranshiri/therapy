@@ -1,57 +1,82 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger, Inject } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import OpenAI from 'openai';
 import { SessionEntry } from '../sessions/entities/session-entry.entity';
+import { IEmbeddingProvider } from '../rag/interfaces/embedding-provider.interface';
+import { EMBEDDING_PROVIDER } from '../rag/constants/tokens';
 
 @Injectable()
 export class AiService {
-  private readonly mockMode: boolean;
-  private readonly embeddingDimensions: number;
+  private readonly logger = new Logger(AiService.name);
+  private readonly openai: OpenAI | null;
 
-  constructor(private configService: ConfigService) {
-    this.mockMode = this.configService.get('MOCK_AI') === 'true';
-    this.embeddingDimensions = parseInt(
-      this.configService.get('EMBEDDING_DIMENSIONS') || '1536',
-    );
+  constructor(
+    private readonly configService: ConfigService,
+    @Inject(EMBEDDING_PROVIDER)
+    private readonly embeddingProvider: IEmbeddingProvider,
+  ) {
+    const apiKey = this.configService.get<string>('OPENAI_API_KEY');
+    this.openai = apiKey ? new OpenAI({ apiKey }) : null;
   }
 
   /**
    * Generate summary from session entries
-   * In mock mode, generates a template-based summary
-   * In real mode, would call OpenAI GPT API
+   * Uses OpenAI if available; otherwise falls back to a simple template.
    */
   async generateSummary(entries: SessionEntry[]): Promise<string> {
-    if (this.mockMode) {
-      return this.mockGenerateSummary(entries);
+    if (!entries || entries.length === 0) {
+      return 'No entries available to summarize.';
+    }
+
+    if (!this.openai) {
+      this.logger.warn('OPENAI_API_KEY not set; using fallback summary.');
+      return this.fallbackSummary(entries);
     }
     
-    // TODO: Implement real OpenAI API call when key is available
-    // const openai = new OpenAI({ apiKey: this.configService.get('OPENAI_API_KEY') });
-    // const response = await openai.chat.completions.create({...});
-    
-    return this.mockGenerateSummary(entries);
+    try {
+      const recent = entries.slice(-12); // keep prompt small
+      const transcript = recent
+        .map((e) => `${e.speaker}: ${e.content}`)
+        .join('\n');
+
+      const prompt = `
+Summarize this therapy session concisely.
+Include: main concerns, interventions, and progress/next steps.
+Keep under 140 words.
+
+Transcript:
+${transcript}
+`;
+
+      const response = await this.openai.chat.completions.create({
+        model: 'gpt-4o-mini',
+        messages: [
+          { role: 'system', content: 'You are a concise clinical note summarizer.' },
+          { role: 'user', content: prompt },
+        ],
+        temperature: 0.3,
+        max_tokens: 220,
+      });
+
+      const summary = response.choices?.[0]?.message?.content?.trim();
+      return summary || this.fallbackSummary(entries);
+    } catch (err) {
+      this.logger.warn(`Summary generation failed, using fallback: ${err}`);
+      return this.fallbackSummary(entries);
+    }
   }
 
   /**
    * Generate embeddings for text
-   * In mock mode, generates deterministic vectors based on text content
-   * In real mode, would call OpenAI Embeddings API
+   * Delegates to the configured embedding provider (OpenAI embedding provider).
    */
   async generateEmbedding(text: string): Promise<number[]> {
-    if (this.mockMode) {
-      return this.mockGenerateEmbedding(text);
-    }
-    
-    // TODO: Implement real OpenAI API call
-    // const openai = new OpenAI({ apiKey: this.configService.get('OPENAI_API_KEY') });
-    // const response = await openai.embeddings.create({...});
-    
-    return this.mockGenerateEmbedding(text);
+    return this.embeddingProvider.embedText(text);
   }
 
   /**
    * Transcribe audio to text with speaker diarization
-   * In mock mode, returns simulated transcript
-   * In real mode, would call OpenAI Whisper API
+   * Currently mock; can be swapped to Whisper when needed.
    */
   async transcribeAudio(audioBuffer: Buffer): Promise<{
     text: string;
@@ -62,142 +87,21 @@ export class AiService {
       endTime: number;
     }>;
   }> {
-    if (this.mockMode) {
-      return this.mockTranscribeAudio(audioBuffer);
-    }
-    
-    // TODO: Implement real OpenAI Whisper API call
-    // const openai = new OpenAI({ apiKey: this.configService.get('OPENAI_API_KEY') });
-    // const response = await openai.audio.transcriptions.create({...});
-    
+    // Placeholder mock; replace with Whisper call when available.
     return this.mockTranscribeAudio(audioBuffer);
   }
 
-  /**
-   * Calculate cosine similarity between two vectors
-   */
-  cosineSimilarity(vecA: number[], vecB: number[]): number {
-    if (vecA.length !== vecB.length) {
-      throw new Error('Vectors must have same dimensions');
-    }
+  // ===== Helpers =====
 
-    let dotProduct = 0;
-    let normA = 0;
-    let normB = 0;
-
-    for (let i = 0; i < vecA.length; i++) {
-      dotProduct += vecA[i] * vecB[i];
-      normA += vecA[i] * vecA[i];
-      normB += vecB[i] * vecB[i];
-    }
-
-    return dotProduct / (Math.sqrt(normA) * Math.sqrt(normB));
-  }
-
-  // ===== MOCK IMPLEMENTATIONS =====
-
-  private mockGenerateSummary(entries: SessionEntry[]): string {
-    if (entries.length === 0) {
-      return 'No entries available to summarize.';
-    }
-
-    const therapistEntries = entries.filter((e) => e.speaker === 'therapist');
-    const clientEntries = entries.filter((e) => e.speaker === 'client');
-
-    // Use last 3 entries for summary
-    const recentEntries = entries.slice(-3);
-    const recentText = recentEntries
+  private fallbackSummary(entries: SessionEntry[]): string {
+    const recent = entries.slice(-3);
+    const recentText = recent
       .map((e) => `${e.speaker}: ${e.content}`)
       .join(' ');
-
-    return `Session Summary (Mock Generated):
+    return `Session Summary (Fallback):
     
-Duration: ${entries.length} exchanges
-Therapist statements: ${therapistEntries.length}
-Client statements: ${clientEntries.length}
-
-Key Discussion Points:
-${recentText.substring(0, 200)}...
-
-Assessment: This was a productive session with active engagement from both parties. 
-The client demonstrated good insight and willingness to explore difficult topics.
-
-Recommended Follow-up: Continue current therapeutic approach and monitor progress.
-
-Note: This is a mock summary. With OpenAI API key, this would provide detailed, 
-contextual analysis using GPT-4.`;
-  }
-
-  /**
-   * Generate deterministic mock embedding based on text content
-   * This ensures similar text gets similar embeddings
-   */
-  private mockGenerateEmbedding(text: string): number[] {
-    // Normalize text for consistent embeddings
-    const normalizedText = text.toLowerCase().trim();
-    
-    // Extract keywords (words > 3 chars, remove common words)
-    const stopWords = new Set(['the', 'and', 'for', 'with', 'this', 'that', 'from', 'have', 'been', 'were', 'was']);
-    const words = normalizedText
-      .split(/\s+/)
-      .filter(w => w.length > 3 && !stopWords.has(w));
-    
-    // Create a deterministic seed from text
-    const textHash = this.simpleHash(normalizedText);
-    
-    // Generate base vector using seeded random
-    const vector: number[] = [];
-    let rng = this.seededRandom(textHash);
-    
-    for (let i = 0; i < this.embeddingDimensions; i++) {
-      // Base random value from hash
-      const baseValue = (rng() - 0.5) * 2;
-      
-      // Add influence from keywords to create semantic similarity
-      let keywordInfluence = 0;
-      words.forEach((word, idx) => {
-        // Each keyword contributes to certain dimensions
-        const wordHash = this.simpleHash(word);
-        const influenceIdx = wordHash % this.embeddingDimensions;
-        if (Math.abs(influenceIdx - i) < 50) { // Influence nearby dimensions
-          keywordInfluence += 0.1 * Math.cos((wordHash + i) * 0.01);
-        }
-      });
-      
-      vector.push(baseValue + keywordInfluence);
-    }
-    
-    // Normalize to unit vector
-    const sumSquares = vector.reduce((sum, v) => sum + v * v, 0);
-    const norm = Math.sqrt(sumSquares);
-    
-    return vector.map((v) => v / norm);
-  }
-  
-  /**
-   * Simple hash function for deterministic seed generation
-   */
-  private simpleHash(str: string): number {
-    let hash = 0;
-    for (let i = 0; i < str.length; i++) {
-      const char = str.charCodeAt(i);
-      hash = ((hash << 5) - hash) + char;
-      hash = hash & hash; // Convert to 32-bit integer
-    }
-    return Math.abs(hash);
-  }
-  
-  /**
-   * Seeded pseudo-random number generator
-   * Returns a function that generates deterministic "random" numbers
-   */
-  private seededRandom(seed: number): () => number {
-    let state = seed;
-    return () => {
-      // Linear congruential generator
-      state = (state * 1664525 + 1013904223) % 4294967296;
-      return state / 4294967296;
-    };
+Exchanges: ${entries.length}
+Recent: ${recentText.substring(0, 240)}...`;
   }
 
   private mockTranscribeAudio(audioBuffer: Buffer): {

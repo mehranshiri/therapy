@@ -1,4 +1,6 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import OpenAI from 'openai';
 import { SearchResult } from '../../interfaces/vector-store.interface';
 
 /**
@@ -8,6 +10,19 @@ import { SearchResult } from '../../interfaces/vector-store.interface';
  */
 @Injectable()
 export class CrossEncoderReranker {
+  private readonly logger = new Logger(CrossEncoderReranker.name);
+  private readonly cohereApiKey?: string;
+  private readonly cohereModel = 'rerank-english-v3.0'; // Cohere rerank model
+  private readonly openaiApiKey?: string;
+  private readonly openai: OpenAI | null;
+  private readonly openaiModel = 'gpt-4o-mini';
+
+  constructor(private readonly configService: ConfigService) {
+    this.cohereApiKey = this.configService.get<string>('COHERE_API_KEY');
+    this.openaiApiKey = this.configService.get<string>('OPENAI_API_KEY');
+    this.openai = this.openaiApiKey ? new OpenAI({ apiKey: this.openaiApiKey }) : null;
+  }
+
   /**
    * Minimum relevance threshold (0.0 to 1.0)
    */
@@ -24,6 +39,26 @@ export class CrossEncoderReranker {
     results: SearchResult[],
     topK: number = 10,
   ): Promise<SearchResult[]> {
+    // Prefer Cohere rerank if API key is present
+    if (this.cohereApiKey) {
+      try {
+        const reranked = await this.rerankWithCohere(query, results, topK);
+        if (reranked.length > 0) return reranked;
+      } catch (err) {
+        this.logger.warn(`Cohere rerank failed, falling back: ${err}`);
+      }
+    }
+
+    // Try OpenAI listwise rerank if available
+    if (this.openai) {
+      try {
+        const reranked = await this.rerankWithOpenAI(query, results, topK);
+        if (reranked.length > 0) return reranked;
+      } catch (err) {
+        this.logger.warn(`OpenAI rerank failed, falling back: ${err}`);
+      }
+    }
+
     // Score each result against the query
     const scoredResults = await Promise.all(
       results.map(async (result) => {
@@ -46,6 +81,116 @@ export class CrossEncoderReranker {
     const relevantResults = scoredResults.filter((r) => r.score >= finalThreshold);
 
     return relevantResults.slice(0, topK);
+  }
+
+  /**
+   * Cohere Rerank (if COHERE_API_KEY is provided)
+   */
+  private async rerankWithCohere(
+    query: string,
+    results: SearchResult[],
+    topK: number,
+  ): Promise<SearchResult[]> {
+    if (!this.cohereApiKey) return [];
+    if (results.length === 0) return [];
+
+    const body = {
+      model: this.cohereModel,
+      query,
+      documents: results.map((r) => r.text),
+      top_n: Math.min(topK, results.length),
+    };
+
+    const response = await fetch('https://api.cohere.ai/v1/rerank', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${this.cohereApiKey}`,
+      },
+      body: JSON.stringify(body),
+    });
+
+    if (!response.ok) {
+      const errText = await response.text();
+      throw new Error(`Cohere rerank error: ${response.status} ${errText}`);
+    }
+
+    const data = await response.json();
+    const reranked: SearchResult[] = data.results
+      .map((item: any) => {
+        const original = results[item.index];
+        if (!original) return null;
+        return {
+          ...original,
+          score: item.relevance_score ?? original.score,
+        };
+      })
+      .filter((x: SearchResult | null): x is SearchResult => !!x)
+      .slice(0, topK);
+
+    return reranked;
+  }
+
+  /**
+   * OpenAI listwise rerank (if OPENAI_API_KEY is provided)
+   * Uses a concise JSON-ranked response to minimize parsing errors.
+   */
+  private async rerankWithOpenAI(
+    query: string,
+    results: SearchResult[],
+    topK: number,
+  ): Promise<SearchResult[]> {
+    if (!this.openai) return [];
+    if (results.length === 0) return [];
+
+    const capped = results.slice(0, Math.min(results.length, 20)); // cap to limit cost
+
+    const docList = capped
+      .map((r, i) => `[${i}] ${r.text}`)
+      .join('\n');
+
+    const prompt = `
+You are reranking search results for relevance to the query.
+Return ONLY a JSON array of result indices in order of relevance (no other text).
+
+Query:
+${query}
+
+Results:
+${docList}
+
+JSON array of indices (most relevant first):
+`;
+
+    const response = await this.openai.chat.completions.create({
+      model: this.openaiModel,
+      messages: [
+        { role: 'system', content: 'You produce JSON arrays of indices for reranking.' },
+        { role: 'user', content: prompt },
+      ],
+      temperature: 0.0,
+      max_tokens: 100,
+    });
+
+    const content = response.choices?.[0]?.message?.content ?? '';
+
+    let indices: number[] = [];
+    try {
+      const parsed = JSON.parse(content);
+      if (Array.isArray(parsed)) {
+        indices = parsed.filter((n) => Number.isInteger(n));
+      }
+    } catch (err) {
+      this.logger.warn(`OpenAI rerank parse failed: ${err}`);
+      return [];
+    }
+
+    const reranked = indices
+      .map((i) => capped[i])
+      .filter((r): r is SearchResult => !!r)
+      .slice(0, topK);
+
+    return reranked;
   }
 
   /**

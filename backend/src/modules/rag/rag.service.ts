@@ -1,4 +1,6 @@
-import { Injectable, Inject } from '@nestjs/common';
+import { Injectable, Inject, Logger } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import OpenAI from 'openai';
 import { IEmbeddingProvider } from './interfaces/embedding-provider.interface';
 import { IVectorStore, VectorDocument } from './interfaces/vector-store.interface';
 import { EMBEDDING_PROVIDER, VECTOR_STORE } from './constants/tokens';
@@ -12,6 +14,10 @@ import { CrossEncoderReranker } from './strategies/reranking/cross-encoder-reran
  */
 @Injectable()
 export class RAGService {
+  private readonly logger = new Logger(RAGService.name);
+  private readonly contextualRetrievalEnabled: boolean;
+  private readonly openai: OpenAI | null;
+
   constructor(
     @Inject(EMBEDDING_PROVIDER)
     private readonly embeddingProvider: IEmbeddingProvider,
@@ -20,7 +26,15 @@ export class RAGService {
     private readonly chunker: SemanticChunker,
     private readonly hybridSearch: HybridSearchStrategy,
     private readonly reranker: CrossEncoderReranker,
-  ) {}
+    private readonly configService: ConfigService,
+  ) {
+    this.contextualRetrievalEnabled =
+      (this.configService.get<string>('CONTEXTUAL_RETRIEVAL_ENABLED') ?? 'true') !==
+      'false';
+
+    const apiKey = this.configService.get<string>('OPENAI_API_KEY');
+    this.openai = apiKey ? new OpenAI({ apiKey }) : null;
+  }
 
   /**
    * Index a document into the RAG system
@@ -57,9 +71,18 @@ export class RAGService {
         throw new Error('Document chunking produced no results');
       }
 
-      // 2. Generate embeddings for all chunks (batch processing for efficiency)
-      const chunkTexts = chunks.map(({ text }) => text);
-      const embeddings = await this.embeddingProvider.embedBatch(chunkTexts);
+      // 2. Generate embeddings with contextual retrieval (batch processing)
+      const contextualizedTexts: string[] = [];
+      const contextSummaries: string[] = [];
+
+      for (const chunk of chunks) {
+        const context = await this.generateContextForChunk(chunk.text, metadata);
+        const combinedText = context ? `${context}\n\n${chunk.text}` : chunk.text;
+        contextualizedTexts.push(combinedText);
+        contextSummaries.push(context);
+      }
+
+      const embeddings = await this.embeddingProvider.embedBatch(contextualizedTexts);
 
       // Validate embeddings match chunks
       if (embeddings.length !== chunks.length) {
@@ -72,7 +95,7 @@ export class RAGService {
       const vectorDocuments: VectorDocument[] = chunks.map((chunk, index) => ({
         id: this.generateDocumentId(metadata.sessionId, index),
         embedding: embeddings[index],
-        text: chunk.text,
+        text: chunk.text, // store original chunk text
         metadata: {
           sessionId: metadata.sessionId,
           therapistId: metadata.therapistId,
@@ -80,6 +103,8 @@ export class RAGService {
           timestamp: metadata.timestamp || new Date().toISOString(),
           ...chunk.metadata,
           indexedAt: new Date().toISOString(),
+          contextSummary: contextSummaries[index] || null,
+          contextualized: !!contextSummaries[index],
         },
       }));
 
@@ -117,6 +142,55 @@ export class RAGService {
     return `${sessionId}_chunk_${chunkIndex}_${timestamp}`;
   }
 
+  /**
+   * Generate brief context for a chunk using OpenAI (if enabled).
+   * Keeps output short to minimize cost and latency.
+   */
+  private async generateContextForChunk(
+    chunkText: string,
+    metadata: Record<string, any>,
+  ): Promise<string> {
+    if (!this.contextualRetrievalEnabled || !this.openai) return '';
+
+    try {
+      const truncatedChunk = chunkText.slice(0, 1200); // limit prompt size
+      const speakerInfo = metadata?.speaker
+        ? `Speaker: ${metadata.speaker}.`
+        : '';
+      const therapistInfo = metadata?.therapistId
+        ? `Therapist ID: ${metadata.therapistId}.`
+        : '';
+
+      const prompt = `
+Summarize and situate this chunk within its session context.
+Include: who is speaking (if evident), topic/theme, and any prior relevant background.
+Keep it under 80 words.
+
+${speakerInfo} ${therapistInfo}
+
+Chunk:
+"${truncatedChunk}"
+`;
+
+      const response = await this.openai.chat.completions.create({
+        model: 'gpt-4o-mini',
+        messages: [
+          { role: 'system', content: 'You write concise context summaries for retrieval.' },
+          { role: 'user', content: prompt },
+        ],
+        max_tokens: 120,
+        temperature: 0.2,
+      });
+
+      const summary =
+        response.choices?.[0]?.message?.content?.trim() ?? '';
+      return summary;
+    } catch (err) {
+      this.logger.warn(`Context generation failed; using raw chunk: ${err}`);
+      return '';
+    }
+  }
+
 
   /**
    * Search with advanced RAG features
@@ -130,24 +204,48 @@ export class RAGService {
       useHybrid?: boolean;
       useReranking?: boolean;
       diversityMode?: boolean;
+      minSimilarity?: number;
+      useHierarchical?: boolean;
     } = {},
   ) {
     const {
       limit = 10,
       therapistId,
       useHybrid = false, // Default to false until keyword search is implemented
-      useReranking = true,
+      useReranking = true, // Enabled: OpenAI reranker available
       diversityMode = false,
+      minSimilarity = 0.3,
+      useHierarchical = true,
     } = options;
 
+    // Hierarchical retrieval: coarse doc search -> chunk/keyword search within those docs
+    let results;
+
+    if (useHierarchical) {
+      results = await this.hierarchicalSearch(
+        query,
+        therapistId,
+        limit,
+        minSimilarity,
+        useHybrid,
+      );
+    } else {
     // 1. Perform search (hybrid or semantic)
-    let results = useHybrid
-      ? await this.hybridSearch.search(query, limit * 2, 0.7, { therapistId })
+      results = useHybrid
+        ? await this.hybridSearch.search(
+            query,
+            limit * 2,
+            0.7,
+            { therapistId },
+            minSimilarity,
+          )
       : await this.vectorStore.search(
           await this.embeddingProvider.embedText(query),
           limit * 2,
           { therapistId } as any,
+            minSimilarity,
         );
+    }
 
     // 2. Apply reranking if enabled
     if (useReranking && results.length > 0) {
@@ -159,6 +257,70 @@ export class RAGService {
     }
 
     return results;
+  }
+
+  /**
+   * Hierarchical retrieval: coarse doc search, then chunk/keyword search within top docs.
+   * Note: current vector store stores session-level embeddings; this narrows keyword search
+   * to top sessions and reuses semantic search on those sessions.
+   */
+  private async hierarchicalSearch(
+    query: string,
+    therapistId: string | undefined,
+    limit: number,
+    minSimilarity: number,
+    useHybrid: boolean,
+  ) {
+    const queryEmbedding = await this.embeddingProvider.embedText(query);
+
+    // Stage 1: document-level (session) semantic search
+    const docResults = await this.vectorStore.search(
+      queryEmbedding,
+      limit * 3, // broader recall
+      { therapistId } as any,
+      minSimilarity * 0.8, // slightly lower to collect candidates
+    );
+
+    if (!docResults.length) return [];
+
+    // Collect candidate session IDs
+    const sessionIds = docResults
+      .map((d) => d.metadata?.sessionId || d.id)
+      .filter(Boolean);
+
+    // Stage 2: search within candidate sessions
+    const filter = { therapistId, sessionIds };
+
+    const chunkResults = useHybrid
+      ? await this.hybridSearch.search(
+          query,
+          limit * 2,
+          0.7,
+          filter,
+          minSimilarity,
+        )
+      : await this.vectorStore.search(
+          queryEmbedding,
+          limit * 2,
+          filter as any,
+          minSimilarity,
+        );
+
+    // Merge scores (optionally combine doc score), then slice
+    const docScoreMap = new Map<string, number>(
+      docResults.map((d) => [d.metadata?.sessionId || d.id, d.score]),
+    );
+
+    const combined = chunkResults.map((c) => {
+      const sid = c.metadata?.sessionId;
+      const docScore = sid ? docScoreMap.get(sid) ?? 0 : 0;
+      const combinedScore = c.score * 0.7 + docScore * 0.3;
+      return { ...c, score: combinedScore };
+    });
+
+    return combined
+      .sort((a, b) => b.score - a.score)
+      .slice(0, limit);
   }
 
   /**

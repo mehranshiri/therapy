@@ -8,6 +8,7 @@ import {
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { Session } from '../../sessions/entities/session.entity';
+import { SessionChunk } from '../entities/session-chunk.entity';
 
 /**
  * PostgreSQL pgvector Adapter
@@ -17,24 +18,31 @@ export class PgVectorAdapter implements IVectorStore {
   constructor(
     @InjectRepository(Session)
     private sessionsRepository: Repository<Session>,
+    @InjectRepository(SessionChunk)
+    private chunksRepository: Repository<SessionChunk>,
   ) {}
 
   async upsert(document: VectorDocument): Promise<void> {
-    // In production with pgvector:
-    // await this.connection.query(
-    //   'INSERT INTO vectors (id, embedding, text, metadata) VALUES ($1, $2, $3, $4) ON CONFLICT (id) DO UPDATE SET embedding = $2, text = $3, metadata = $4',
-    //   [document.id, document.embedding, document.text, document.metadata]
-    // );
-
-    // For SQLite compatibility
-    const session = await this.sessionsRepository.findOne({
-      where: { id: document.metadata.sessionId },
+    // Upsert a chunk-level document into session_chunks
+    const existing = await this.chunksRepository.findOne({
+      where: { id: document.id },
     });
-
-    if (session) {
-      session.embedding = document.embedding;
-      await this.sessionsRepository.save(session);
-    }
+    const chunk = this.chunksRepository.create({
+      id: document.id,
+      sessionId: document.metadata.sessionId,
+      therapistId: document.metadata.therapistId,
+      clientId: document.metadata.clientId,
+      timestamp: document.metadata.timestamp,
+      chunkIndex: document.metadata.chunkIndex,
+      totalChunks: document.metadata.totalChunks,
+      text: document.text,
+      contextSummary: document.metadata.contextSummary ?? null,
+      metadata: document.metadata,
+      embedding: document.embedding,
+      createdAt: existing?.createdAt,
+      updatedAt: existing?.updatedAt,
+    });
+    await this.chunksRepository.save(chunk);
   }
 
   async upsertBatch(documents: VectorDocument[]): Promise<void> {
@@ -45,75 +53,55 @@ export class PgVectorAdapter implements IVectorStore {
     queryEmbedding: number[],
     limit: number = 10,
     filter?: Partial<VectorMetadata>,
+    minSimilarity: number = 0.3,
   ): Promise<SearchResult[]> {
-    // In production with pgvector:
-    // SELECT id, text, metadata, 1 - (embedding <=> $1) as score
-    // FROM vectors
-    // WHERE metadata @> $2
-    //   AND 1 - (embedding <=> $1) > 0.3  -- Minimum similarity threshold
-    // ORDER BY embedding <=> $1
-    // LIMIT $3
-
-    // Current SQLite implementation
-    let query = this.sessionsRepository.createQueryBuilder('session');
+    // Current implementation: cosine similarity over stored chunk embeddings
+    let qb = this.chunksRepository.createQueryBuilder('chunk');
 
     if (filter?.therapistId) {
-      query = query.where('session.therapistId = :therapistId', {
+      qb = qb.where('chunk.therapistId = :therapistId', {
         therapistId: filter.therapistId,
       });
     }
 
-    const sessions = await query
-      .andWhere('session.embedding IS NOT NULL')
-      .leftJoinAndSelect('session.entries', 'entries')
-      .getMany();
+    if (filter?.sessionIds && Array.isArray(filter.sessionIds) && filter.sessionIds.length > 0) {
+      qb = qb.andWhere('chunk.sessionId IN (:...sessionIds)', {
+        sessionIds: filter.sessionIds,
+      });
+    } else if (filter?.sessionId) {
+      qb = qb.andWhere('chunk.sessionId = :sessionId', {
+        sessionId: filter.sessionId,
+      });
+    }
 
-    const results = sessions
-      .map((session) => {
-        const similarity = this.cosineSimilarity(
-          queryEmbedding,
-          session.embedding!,
-        );
+    const chunks = await qb.getMany();
 
-        // Build searchable text from entries (most relevant), transcript, or summary
-        // Entries contain the actual conversation content that was indexed
-        let searchableText = '';
-        if (session.entries && session.entries.length > 0) {
-          // Use entries content (this is what was actually indexed)
-          searchableText = session.entries
-            .map((entry) => `${entry.speaker}: ${entry.content}`)
-            .join('\n');
-        } else if (session.transcript) {
-          searchableText = session.transcript;
-        } else if (session.summary) {
-          searchableText = session.summary;
-        }
-
+    const results = chunks
+      .map((chunk) => {
+        const similarity = this.cosineSimilarity(queryEmbedding, chunk.embedding);
         return {
-          id: session.id,
+          id: chunk.id,
           score: similarity,
-          text: searchableText,
+          text: chunk.text,
           metadata: {
-            sessionId: session.id,
-            therapistId: session.therapistId,
-            clientId: session.clientId,
-            timestamp: session.startTime,
+            sessionId: chunk.sessionId,
+            therapistId: chunk.therapistId || '',
+            clientId: chunk.clientId || '',
+            timestamp: chunk.timestamp || '',
+            chunkIndex: chunk.chunkIndex,
+            totalChunks: chunk.totalChunks,
+            contextSummary: chunk.contextSummary,
           },
         };
       })
+      .filter((result) => result.score >= minSimilarity)
       .sort((a, b) => b.score - a.score);
 
-    // For mock embeddings, similarity scores are very low (near 0) but still provide ranking
-    // Quality filtering is handled by the reranker which uses word overlap (more reliable)
-    // Return top N results - let reranker filter out truly irrelevant results
     return results.slice(0, limit);
   }
 
   async delete(id: string): Promise<void> {
-    const result = await this.sessionsRepository.update(
-      { id },
-      { embedding: null as any }, // TypeORM allows null for nullable fields
-    );
+    const result = await this.chunksRepository.delete({ id });
 
     if (result.affected === 0) {
       throw new Error(`Vector with id ${id} not found`);
@@ -121,31 +109,27 @@ export class PgVectorAdapter implements IVectorStore {
   }
 
   async deleteByMetadata(filter: Partial<VectorMetadata>): Promise<void> {
-    let query = this.sessionsRepository
-      .createQueryBuilder()
-      .update(Session)
-      .set({ embedding: null as any });
+    let qb = this.chunksRepository.createQueryBuilder().delete().from(SessionChunk);
 
-    // Apply filters conditionally
     if (filter.therapistId) {
-      query = query.where('therapistId = :therapistId', {
+      qb = qb.where('therapistId = :therapistId', {
         therapistId: filter.therapistId,
       });
     }
 
     if (filter.sessionId) {
-      query = query.andWhere('id = :sessionId', {
+      qb = qb.andWhere('sessionId = :sessionId', {
         sessionId: filter.sessionId,
       });
     }
 
     if (filter.clientId) {
-      query = query.andWhere('clientId = :clientId', {
+      qb = qb.andWhere('clientId = :clientId', {
         clientId: filter.clientId,
       });
     }
 
-    const result = await query.execute();
+    const result = await qb.execute();
 
     if (result.affected === 0) {
       throw new Error('No vectors found matching the filter criteria');
@@ -153,28 +137,28 @@ export class PgVectorAdapter implements IVectorStore {
   }
 
   async getById(id: string): Promise<VectorDocument | null> {
-    const session = await this.sessionsRepository.findOne({ where: { id } });
-
-    if (!session || !session.embedding) {
-      return null;
-    }
+    const chunk = await this.chunksRepository.findOne({ where: { id } });
+    if (!chunk) return null;
 
     return {
-      id: session.id,
-      embedding: session.embedding,
-      text: session.summary || session.transcript || '',
+      id: chunk.id,
+      embedding: chunk.embedding,
+      text: chunk.text,
       metadata: {
-        sessionId: session.id,
-        therapistId: session.therapistId,
-        clientId: session.clientId,
-        timestamp: session.startTime,
+        sessionId: chunk.sessionId,
+        therapistId: chunk.therapistId || '',
+        clientId: chunk.clientId || '',
+        timestamp: chunk.timestamp || '',
+        chunkIndex: chunk.chunkIndex,
+        totalChunks: chunk.totalChunks,
+        contextSummary: chunk.contextSummary,
       },
     };
   }
 
   async healthCheck(): Promise<boolean> {
     try {
-      await this.sessionsRepository.count();
+      await this.chunksRepository.count();
       return true;
     } catch {
       return false;
