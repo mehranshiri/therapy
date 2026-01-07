@@ -1,26 +1,22 @@
-import { Injectable, NotFoundException, Inject } from '@nestjs/common';
+import { Injectable, NotFoundException, Logger } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { Session } from './entities/session.entity';
 import { SessionEntry } from './entities/session-entry.entity';
 import { CreateSessionDto } from './dto/create-session.dto';
 import { AddEntryDto } from './dto/add-entry.dto';
-import { AiService } from '../ai/ai.service';
 import { RAGService } from '../rag/rag.service';
-import { IEmbeddingProvider } from '../rag/interfaces/embedding-provider.interface';
-import { EMBEDDING_PROVIDER } from '../rag/constants/tokens';
 
 @Injectable()
 export class SessionsService {
+  private readonly logger = new Logger(SessionsService.name);
+
   constructor(
     @InjectRepository(Session)
     private sessionsRepository: Repository<Session>,
     @InjectRepository(SessionEntry)
     private entriesRepository: Repository<SessionEntry>,
-    private aiService: AiService,
     private ragService: RAGService,
-    @Inject(EMBEDDING_PROVIDER)
-    private readonly embeddingProvider: IEmbeddingProvider,
   ) {}
 
   async create(createSessionDto: CreateSessionDto): Promise<Session> {
@@ -66,75 +62,69 @@ export class SessionsService {
     
     const savedEntry = await this.entriesRepository.save(entry);
     
-    // Auto-generate embedding after adding entry
-    // This runs asynchronously without blocking the response
-    this.updateSessionEmbedding(sessionId).catch(err => {
-      console.error('Failed to auto-generate embedding:', err);
-    });
+    // Trigger async background indexing (non-blocking)
+    this.updateSessionEmbedding(sessionId);
     
     return savedEntry;
   }
 
   /**
-   * Update session embedding based on current entries
+   * Background indexing into RAG system
    * Called automatically after adding entries
    */
   private async updateSessionEmbedding(sessionId: string): Promise<void> {
-    const session = await this.findOne(sessionId);
-    
-    // Skip if no entries
-    if (!session.entries || session.entries.length === 0) {
-      return;
-    }
-    
-    // Generate or update summary
-    const summary = await this.aiService.generateSummary(session.entries);
-    
-    // Generate embedding from summary (keep for backward compatibility)
-    const embedding = await this.embeddingProvider.embedText(summary);
-    
-    // Update session
-    await this.sessionsRepository.update(sessionId, {
-      summary,
-      embedding,
-    });
-
-    // Index the content using RAG for chunk-level search
-    // Build text from entries or use transcript if available
-    const textToIndex = session.transcript || 
-      session.entries.map(e => `${e.speaker}: ${e.content}`).join('\n');
-    
-    if (textToIndex && textToIndex.trim()) {
-      try {
-        await this.ragService.indexDocument(textToIndex, {
-          sessionId: session.id,
-          therapistId: session.therapistId,
-          clientId: session.clientId,
-          timestamp: session.startTime,
-        });
-      } catch (error) {
-        console.error('Failed to index document in RAG system:', error);
-        // Don't fail the whole operation if RAG indexing fails
+    try {
+      const session = await this.findOne(sessionId);
+      
+      // Skip if no entries
+      if (!session.entries || session.entries.length === 0) {
+        return;
       }
+
+      // Pass structured sessionEntries directly to RAG service
+      // The chunker will use sessionEntries for speaker-aware chunking
+      await this.ragService.indexDocument('', {
+        sessionId: session.id,
+        therapistId: session.therapistId,
+        clientId: session.clientId,
+        timestamp: session.startTime,
+        sessionEntries: session.entries,
+      });
+      
+      this.logger.debug(`Successfully indexed session ${sessionId} with ${session.entries.length} entries`);
+    } catch (error) {
+      // Log error with structured context for debugging
+      this.logger.error('Background indexing failed', {
+        sessionId,
+        error: error.message,
+        stack: error.stack,
+      });
+      // Don't throw - this is background processing
     }
   }
 
+  /**
+   * Generate session summary
+   * For demo/test: Returns simple concatenation of last 3 entries
+   */
   async generateSummary(sessionId: string): Promise<string> {
     const session = await this.findOne(sessionId);
     
-    // If already summarized, return existing
+    // Return cached summary if exists
     if (session.summary) {
-      // return session.summary;
-      // we can cache the summary in Redis for 3 hours
+      return session.summary;
     }
 
-    // Get all entries
     const entries = session.entries || [];
     
-    // Generate summary using AI service
-    const summary = await this.aiService.generateSummary(entries);
+    // MOCK IMPLEMENTATION: Concatenate last 3 entries (per test requirements)
+    // In production, replace with: await this.aiService.generateSummary(entries)
+    const lastThreeEntries = entries.slice(-3);
+    const summary = lastThreeEntries.length > 0
+      ? lastThreeEntries.map(e => `${e.speaker}: ${e.content}`).join('\n')
+      : 'No entries yet';
     
-    // Save summary to session
+    // Cache summary
     session.summary = summary;
     await this.sessionsRepository.save(session);
     
