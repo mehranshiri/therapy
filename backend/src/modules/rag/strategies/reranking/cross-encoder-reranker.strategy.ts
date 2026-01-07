@@ -248,31 +248,44 @@ JSON array of indices (most relevant first):
    * Filters out short words and common stop words
    * 
    * @param text Input text
-   * @returns Set of normalized significant words
+   * @returns Set of normalized significant words (unique)
    */
   private extractSignificantWords(text: string): Set<string> {
+    return new Set(this.extractSignificantWordsArray(text));
+  }
+
+  /**
+   * Extract significant words as array (preserves duplicates for TF counting)
+   * 
+   * @param text Input text
+   * @returns Array of normalized significant words (with duplicates)
+   */
+  private extractSignificantWordsArray(text: string): string[] {
     const MIN_WORD_LENGTH = 3;
     const STOP_WORDS = new Set([
       'the', 'and', 'for', 'with', 'this', 'that', 'from', 'have', 'been',
       'were', 'was', 'are', 'you', 'your', 'can', 'will', 'would', 'should',
-      'could', 'may', 'might', 'must', 'shall', 'the', 'a', 'an', 'as',
+      'could', 'may', 'might', 'must', 'shall', 'a', 'an', 'as', 'but', 'not',
     ]);
 
-    return new Set(
-      text
-        .toLowerCase()
-        .split(/\s+/)
-        .map((word) => word.replace(/[^\w]/g, '')) // Remove punctuation
-        .filter(
-          (word) =>
-            word.length >= MIN_WORD_LENGTH && !STOP_WORDS.has(word),
-        ),
-    );
+    return text
+      .toLowerCase()
+      .split(/\s+/)
+      .map((word) => word.replace(/[^\w]/g, '')) // Remove punctuation
+      .filter(
+        (word) =>
+          word.length >= MIN_WORD_LENGTH && !STOP_WORDS.has(word),
+      );
   }
 
   /**
    * Maximal Marginal Relevance (MMR) Reranking
    * Balances relevance with diversity to avoid redundant results
+   * 
+   * BEST PRACTICE: Uses vector similarity (dot product) when embeddings available
+   * FALLBACK: Uses TF-Cosine text similarity when embeddings missing
+   * 
+   * Strategy: Per-pair decision (not all-or-nothing) for optimal performance
    */
   async rerankWithMMR(
     query: string,
@@ -294,17 +307,14 @@ JSON array of indices (most relevant first):
 
       // For each remaining document, compute MMR score
       remaining.forEach((doc, index) => {
-        // Relevance to query
+        // Relevance to query (from initial search)
         const relevance = doc.score;
 
         // Maximum similarity to already selected documents
-        const maxSimilarity = Math.max(
-          ...selected.map((sel) =>
-            this.cosineSimilarity(doc.text, sel.text),
-          ),
-        );
+        // Uses per-pair decision: vector if available, text otherwise
+        const maxSimilarity = this.computeMaxSimilarity(doc, selected);
 
-        // MMR score
+        // MMR score: balance relevance and diversity
         const mmrScore = lambda * relevance - (1 - lambda) * maxSimilarity;
 
         if (mmrScore > bestScore) {
@@ -320,16 +330,116 @@ JSON array of indices (most relevant first):
   }
 
   /**
-   * Simple cosine similarity for text (using word vectors)
+   * Compute maximum similarity between a document and selected documents
+   * BEST PRACTICE: Per-pair decision for optimal performance
+   * - Uses vector similarity (dot product) when both docs have embeddings
+   * - Falls back to TF-Cosine text similarity when embeddings missing
    */
-  private cosineSimilarity(text1: string, text2: string): number {
-    const words1 = text1.toLowerCase().split(/\s+/);
-    const words2 = new Set(text2.toLowerCase().split(/\s+/));
+  private computeMaxSimilarity(doc: SearchResult, selected: SearchResult[]): number {
+    if (selected.length === 0) return 0;
 
-    const intersection = words1.filter((w) => words2.has(w)).length;
-    const union = words1.length + words2.size - intersection;
-
-    return intersection / Math.max(union, 1);
+    return Math.max(
+      ...selected.map((sel) => {
+        // Try vector similarity first (most accurate, fastest)
+        if (doc.embedding && sel.embedding && 
+            doc.embedding.length > 0 && sel.embedding.length > 0) {
+          return this.dotProduct(doc.embedding, sel.embedding);
+        }
+        // Fallback to text similarity
+        return this.tfCosineSimilarity(doc.text, sel.text);
+      }),
+    );
   }
+
+  /**
+   * Dot product for normalized vectors (OpenAI embeddings)
+   * For normalized vectors, dot product equals cosine similarity
+   */
+  private dotProduct(vecA: number[], vecB: number[]): number {
+    if (vecA.length !== vecB.length) {
+      this.logger.warn(`Vector dimension mismatch in MMR: ${vecA.length} vs ${vecB.length}`);
+      return 0;
+    }
+
+    let product = 0;
+    for (let i = 0; i < vecA.length; i++) {
+      product += vecA[i] * vecB[i];
+    }
+
+    // Clamp to [-1, 1] for safety (handles floating point errors)
+    return Math.max(-1, Math.min(1, product));
+  }
+
+  /**
+   * TF-weighted cosine similarity for text
+   * 
+   * Accounts for word frequency (term frequency), which is important for
+   * therapy sessions where repeated terms indicate emphasis/importance.
+   * 
+   * @param text1 First document text
+   * @param text2 Second document text
+   * @returns Similarity score between 0 and 1 (1 = identical)
+   */
+  private tfCosineSimilarity(text1: string, text2: string): number {
+    // Extract significant words as ARRAYS (preserve duplicates for TF counting)
+    const words1 = this.extractSignificantWordsArray(text1);
+    const words2 = this.extractSignificantWordsArray(text2);
+
+    // Handle empty text edge cases
+    if (words1.length === 0 || words2.length === 0) {
+      return 0;
+    }
+
+    // Build term frequency maps
+    const tf1 = this.buildTermFrequency(words1);
+    const tf2 = this.buildTermFrequency(words2);
+
+    // Build combined vocabulary
+    const vocab = new Set([...tf1.keys(), ...tf2.keys()]);
+
+    // Compute cosine similarity
+    let dotProduct = 0;
+    let norm1 = 0;
+    let norm2 = 0;
+
+    vocab.forEach(term => {
+      const freq1 = tf1.get(term) || 0;
+      const freq2 = tf2.get(term) || 0;
+
+      dotProduct += freq1 * freq2;
+      norm1 += freq1 * freq1;
+      norm2 += freq2 * freq2;
+    });
+
+    const denominator = Math.sqrt(norm1) * Math.sqrt(norm2);
+    
+    // Division by zero protection
+    if (denominator === 0 || !Number.isFinite(denominator)) {
+      return 0;
+    }
+
+    const similarity = dotProduct / denominator;
+    
+    // Clamp to [0, 1] to handle floating point errors
+    return Math.max(0, Math.min(1, similarity));
+  }
+
+  /**
+   * Build term frequency map from array of words
+   * Handles duplicates in the input array (from text with repeated terms)
+   * 
+   * @param words Array of words (can contain duplicates)
+   * @returns Map of word -> frequency
+   */
+  private buildTermFrequency(words: string[]): Map<string, number> {
+    const tf = new Map<string, number>();
+    
+    for (const word of words) {
+      tf.set(word, (tf.get(word) || 0) + 1);
+    }
+    
+    return tf;
+  }
+
 }
 
