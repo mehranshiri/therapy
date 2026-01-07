@@ -40,8 +40,12 @@ export class RAGService {
    * Index a document into the RAG system
    * Pipeline: Chunk → Embed → Store
    * 
-   * @param text - The document text to index
-   * @param metadata - Metadata (sessionId, therapistId, etc.)
+   * OPTIMIZED: Accepts either text OR sessionEntries in metadata
+   * - If sessionEntries provided: Uses structured data for speaker-aware chunking
+   * - If text provided: Falls back to text-based chunking
+   * 
+   * @param text - The document text to index (optional if sessionEntries provided)
+   * @param metadata - Metadata (sessionId, therapistId, sessionEntries, etc.)
    * @returns Promise with indexing results
    * @throws Error if indexing fails
    */
@@ -56,9 +60,12 @@ export class RAGService {
     const startTime = Date.now();
 
     try {
-      // Validate inputs
-      if (!text?.trim()) {
-        throw new Error('Text content is required for indexing');
+      // Validate inputs: Require either text OR sessionEntries
+      const hasText = text?.trim();
+      const hasSessionEntries = metadata?.sessionEntries && Array.isArray(metadata.sessionEntries) && metadata.sessionEntries.length > 0;
+      
+      if (!hasText && !hasSessionEntries) {
+        throw new Error('Either text content or sessionEntries is required for indexing');
       }
       if (!metadata?.sessionId) {
         throw new Error('SessionId is required in metadata');
@@ -72,14 +79,24 @@ export class RAGService {
       }
 
       // 2. Generate embeddings with contextual retrieval (batch processing)
-      const contextualizedTexts: string[] = [];
-      const contextSummaries: string[] = [];
+      let contextualizedTexts: string[];
+      let contextSummaries: string[];
 
-      for (const chunk of chunks) {
-        const context = await this.generateContextForChunk(chunk.text, metadata);
-        const combinedText = context ? `${context}\n\n${chunk.text}` : chunk.text;
-        contextualizedTexts.push(combinedText);
-        contextSummaries.push(context);
+      if (this.contextualRetrievalEnabled && this.openai) {
+        const contextPromises = chunks.map(chunk => 
+          this.generateContextForChunk(chunk.text, metadata)
+        );
+        contextSummaries = await Promise.all(contextPromises);
+        
+        // Combine context with chunk text
+        contextualizedTexts = chunks.map((chunk, index) => {
+          const context = contextSummaries[index];
+          return context ? `${context}\n\n${chunk.text}` : chunk.text;
+        });
+      } else {
+        // No contextual retrieval: use raw chunks
+        contextualizedTexts = chunks.map(chunk => chunk.text);
+        contextSummaries = chunks.map(() => '');
       }
 
       const embeddings = await this.embeddingProvider.embedBatch(contextualizedTexts);
@@ -108,7 +125,15 @@ export class RAGService {
         },
       }));
 
-      // 4. Store in vector database (atomic operation)
+      // 4. Store in vector database using upsert (atomic operation)
+      // With deterministic IDs, upsert will UPDATE existing chunks and CREATE new ones
+      // This is safe for test mode where entries are only added (never deleted)
+      // 
+      // Note: If entries can be deleted in production, add cleanup for orphaned chunks:
+      // await this.vectorStore.deleteByMetadata({ 
+      //   sessionId: metadata.sessionId, 
+      //   chunkIndex: { $gte: chunks.length } 
+      // });
       await this.vectorStore.upsertBatch(vectorDocuments);
 
       const duration = Date.now() - startTime;
@@ -121,25 +146,32 @@ export class RAGService {
     } catch (error) {
       const duration = Date.now() - startTime;
       
-      // Log error with context
-      console.error('Failed to index document:', {
+      // Log error with structured context
+      this.logger.error('Failed to index document', {
         sessionId: metadata?.sessionId,
         error: error.message,
+        stack: error.stack,
         duration,
       });
 
+      // Re-throw with context for caller to handle
       throw new Error(
-        `Document indexing failed: ${error.message}`,
+        `Document indexing failed for session ${metadata?.sessionId}: ${error.message}`,
       );
     }
   }
 
   /**
-   * Generate unique document ID for vector storage
+   * Generate deterministic document ID for vector storage
+   * 
+   * CRITICAL: ID must be deterministic (no timestamp) to enable proper upserts.
+   * Without this, every reindex creates duplicate chunks instead of updating existing ones.
+   * 
+   * Format: sessionId_chunk_index
+   * Example: abc123_chunk_0, abc123_chunk_1, etc.
    */
   private generateDocumentId(sessionId: string, chunkIndex: number): string {
-    const timestamp = Date.now();
-    return `${sessionId}_chunk_${chunkIndex}_${timestamp}`;
+    return `${sessionId}_chunk_${chunkIndex}`;
   }
 
   /**

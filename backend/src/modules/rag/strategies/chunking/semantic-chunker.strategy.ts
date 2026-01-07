@@ -27,7 +27,14 @@ export class SemanticChunker implements IDocumentProcessor {
     text: string,
     metadata: Record<string, any> = {},
   ): Promise<ProcessedChunk[]> {
-    const chunks = await this.chunkText(text);
+    // OPTIMIZED: Prefer structured sessionEntries over plain text
+    // If structured sessionEntries are provided, use speaker-aware chunking
+    // This provides better context preservation than plain text parsing
+    const hasSessionEntries = metadata.sessionEntries && Array.isArray(metadata.sessionEntries) && metadata.sessionEntries.length > 0;
+    
+    const chunks = hasSessionEntries
+      ? await this.chunkBySpeakerEntries(metadata.sessionEntries)
+      : await this.chunkText(text);
 
     const processedChunks: ProcessedChunk[] = chunks.map((chunk, index) => ({
       text: chunk,
@@ -53,6 +60,12 @@ export class SemanticChunker implements IDocumentProcessor {
    * Chunk text using proper token counting and speaker awareness
    */
   private async chunkText(text: string): Promise<string[]> {
+    // Handle empty or whitespace-only text
+    if (!text || !text.trim()) {
+      this.logger.warn('Received empty text for chunking');
+      return [];
+    }
+
     // Check if text contains speaker turns (therapy session format)
     const hasSpeakerTurns = this.detectSpeakerTurns(text);
 
@@ -61,6 +74,88 @@ export class SemanticChunker implements IDocumentProcessor {
     } else {
       return this.chunkBySentences(text);
     }
+  }
+
+  /**
+   * Chunk using structured SessionEntry objects (more accurate than text parsing)
+   * Preserves speaker turns and dialogue context
+   * 
+   * BEST PRACTICE: Structured data chunking prevents context loss that can occur
+   * when parsing speaker turns from plain text.
+   */
+  private async chunkBySpeakerEntries(entries: any[]): Promise<string[]> {
+    // Validate input
+    if (!entries || entries.length === 0) {
+      this.logger.warn('Received empty entries array for chunking');
+      return [];
+    }
+
+    const chunks: string[] = [];
+    let currentChunk: any[] = [];
+    let currentTokens = 0;
+
+    for (const entry of entries) {
+      // Skip invalid entries
+      if (!entry?.speaker || !entry?.content) {
+        this.logger.warn('Skipping invalid entry in chunking', { entry });
+        continue;
+      }
+
+      const entryText = `${entry.speaker}: ${entry.content}`;
+      const entryTokens = this.countTokens(entryText);
+
+      // Check if adding this entry exceeds max chunk size
+      if (currentTokens + entryTokens > this.maxChunkSize && currentChunk.length > 0) {
+        // Push current chunk
+        chunks.push(this.formatEntries(currentChunk));
+        
+        // Create overlap by keeping last few entries
+        const overlapEntries = this.getOverlapEntries(currentChunk);
+        currentChunk = [...overlapEntries, entry];
+        currentTokens = this.countTokens(this.formatEntries(currentChunk));
+      } else {
+        currentChunk.push(entry);
+        currentTokens += entryTokens;
+      }
+    }
+
+    // Add remaining chunk
+    if (currentChunk.length > 0) {
+      chunks.push(this.formatEntries(currentChunk));
+    }
+
+    return chunks.length > 0 ? chunks : [this.formatEntries(entries)];
+  }
+
+  /**
+   * Format entries array into text string
+   */
+  private formatEntries(entries: any[]): string {
+    return entries.map(e => `${e.speaker}: ${e.content}`).join('\n');
+  }
+
+  /**
+   * Get overlap entries for context continuity
+   */
+  private getOverlapEntries(entries: any[]): any[] {
+    const overlapEntries: any[] = [];
+    let overlapTokens = 0;
+
+    // Iterate backwards to get most recent entries that fit in overlap
+    for (let i = entries.length - 1; i >= 0; i--) {
+      const entry = entries[i];
+      const entryText = `${entry.speaker}: ${entry.content}`;
+      const entryTokens = this.countTokens(entryText);
+
+      if (overlapTokens + entryTokens <= this.overlap) {
+        overlapEntries.unshift(entry); // Add to beginning to maintain order
+        overlapTokens += entryTokens;
+      } else {
+        break;
+      }
+    }
+
+    return overlapEntries;
   }
 
   /**
