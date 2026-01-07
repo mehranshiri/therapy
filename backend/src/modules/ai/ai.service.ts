@@ -1,9 +1,7 @@
-import { Injectable, Logger, Inject } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import OpenAI from 'openai';
 import { SessionEntry } from '../sessions/entities/session-entry.entity';
-import { IEmbeddingProvider } from '../rag/interfaces/embedding-provider.interface';
-import { EMBEDDING_PROVIDER } from '../rag/constants/tokens';
 
 @Injectable()
 export class AiService {
@@ -12,8 +10,6 @@ export class AiService {
 
   constructor(
     private readonly configService: ConfigService,
-    @Inject(EMBEDDING_PROVIDER)
-    private readonly embeddingProvider: IEmbeddingProvider,
   ) {
     const apiKey = this.configService.get<string>('OPENAI_API_KEY');
     this.openai = apiKey ? new OpenAI({ apiKey }) : null;
@@ -66,13 +62,6 @@ ${transcript}
     }
   }
 
-  /**
-   * Generate embeddings for text
-   * Delegates to the configured embedding provider (OpenAI embedding provider).
-   */
-  async generateEmbedding(text: string): Promise<number[]> {
-    return this.embeddingProvider.embedText(text);
-  }
 
   /**
    * Transcribe audio to text with speaker diarization

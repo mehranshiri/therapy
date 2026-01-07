@@ -27,6 +27,7 @@ export interface SearchResult {
   score: number;
   text: string;
   metadata: VectorMetadata;
+  embedding?: number[]; // Optional: Include for MMR diversity calculation
 }
 
 export interface IVectorStore {

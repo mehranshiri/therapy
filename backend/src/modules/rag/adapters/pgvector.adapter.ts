@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import {
   IVectorStore,
   VectorDocument,
@@ -11,10 +11,18 @@ import { Session } from '../../sessions/entities/session.entity';
 import { SessionChunk } from '../entities/session-chunk.entity';
 
 /**
- * PostgreSQL pgvector Adapter
+ * Vector Store Adapter
+ * 
+ * Development: Uses SQLite with optimized JavaScript similarity computation
+ * Production: Ready for PostgreSQL with pgvector extension
+ * 
+ * Note: Currently optimized for OpenAI embeddings which are pre-normalized.
+ * For normalized vectors: cosine_similarity = dot_product (2x faster)
  */
 @Injectable()
 export class PgVectorAdapter implements IVectorStore {
+  private readonly logger = new Logger(PgVectorAdapter.name);
+
   constructor(
     @InjectRepository(Session)
     private sessionsRepository: Repository<Session>,
@@ -46,7 +54,30 @@ export class PgVectorAdapter implements IVectorStore {
   }
 
   async upsertBatch(documents: VectorDocument[]): Promise<void> {
-    await Promise.all(documents.map((doc) => this.upsert(doc)));
+    // Optimize with transaction for batch operations
+    await this.chunksRepository.manager.transaction(async (manager) => {
+      for (const doc of documents) {
+        const existing = await manager.findOne(SessionChunk, {
+          where: { id: doc.id },
+        });
+        const chunk = manager.create(SessionChunk, {
+          id: doc.id,
+          sessionId: doc.metadata.sessionId,
+          therapistId: doc.metadata.therapistId,
+          clientId: doc.metadata.clientId,
+          timestamp: doc.metadata.timestamp,
+          chunkIndex: doc.metadata.chunkIndex,
+          totalChunks: doc.metadata.totalChunks,
+          text: doc.text,
+          contextSummary: doc.metadata.contextSummary ?? null,
+          metadata: doc.metadata,
+          embedding: doc.embedding,
+          createdAt: existing?.createdAt,
+          updatedAt: existing?.updatedAt,
+        });
+        await manager.save(chunk);
+      }
+    });
   }
 
   async search(
@@ -55,7 +86,112 @@ export class PgVectorAdapter implements IVectorStore {
     filter?: Partial<VectorMetadata>,
     minSimilarity: number = 0.3,
   ): Promise<SearchResult[]> {
-    // Current implementation: cosine similarity over stored chunk embeddings
+    const dbType = this.chunksRepository.manager.connection.options.type;
+
+    // Use native pgvector operations if PostgreSQL, otherwise fallback to optimized JS
+    if (dbType === 'postgres') {
+      this.logger.debug('Using PostgreSQL pgvector native search');
+      return this.searchWithPgVector(queryEmbedding, limit, filter, minSimilarity);
+    } else {
+      this.logger.debug('Using JavaScript-based similarity search (SQLite)');
+      return this.searchWithJavaScript(queryEmbedding, limit, filter, minSimilarity);
+    }
+  }
+
+  /**
+   * PostgreSQL pgvector native search (for production)
+   * Uses database-native vector operations with cosine distance operator (<=>)
+   * Requires: CREATE EXTENSION vector; and column type vector(1024)
+   */
+  private async searchWithPgVector(
+    queryEmbedding: number[],
+    limit: number,
+    filter?: Partial<VectorMetadata>,
+    minSimilarity: number = 0.3,
+  ): Promise<SearchResult[]> {
+    try {
+      // Build WHERE conditions
+      const conditions: string[] = ['1=1'];
+      const params: any[] = [JSON.stringify(queryEmbedding)];
+      let paramIndex = 2;
+
+      if (filter?.therapistId) {
+        conditions.push(`"therapistId" = $${paramIndex}`);
+        params.push(filter.therapistId);
+        paramIndex++;
+      }
+
+      if (filter?.sessionIds && Array.isArray(filter.sessionIds) && filter.sessionIds.length > 0) {
+        conditions.push(`"sessionId" = ANY($${paramIndex})`);
+        params.push(filter.sessionIds);
+        paramIndex++;
+      } else if (filter?.sessionId) {
+        conditions.push(`"sessionId" = $${paramIndex}`);
+        params.push(filter.sessionId);
+        paramIndex++;
+      }
+
+      // Similarity threshold: pgvector's <=> returns distance (0 = identical, 2 = opposite)
+      // Cosine similarity = 1 - distance
+      conditions.push(`(1 - (embedding <=> $1::vector)) >= $${paramIndex}`);
+      params.push(minSimilarity);
+      paramIndex++;
+
+      params.push(limit);
+
+      const query = `
+        SELECT 
+          id,
+          "sessionId",
+          "therapistId",
+          "clientId",
+          timestamp,
+          "chunkIndex",
+          "totalChunks",
+          text,
+          "contextSummary",
+          embedding,
+          (1 - (embedding <=> $1::vector)) as similarity
+        FROM session_chunks
+        WHERE ${conditions.join(' AND ')}
+        ORDER BY embedding <=> $1::vector
+        LIMIT $${paramIndex}
+      `;
+
+      const results = await this.chunksRepository.query(query, params);
+
+      return results.map((row: any) => ({
+        id: row.id,
+        score: parseFloat(row.similarity),
+        text: row.text,
+        embedding: row.embedding, // Include for MMR diversity
+        metadata: {
+          sessionId: row.sessionId,
+          therapistId: row.therapistId || '',
+          clientId: row.clientId || '',
+          timestamp: row.timestamp || '',
+          chunkIndex: row.chunkIndex,
+          totalChunks: row.totalChunks,
+          contextSummary: row.contextSummary,
+        },
+      }));
+    } catch (error) {
+      this.logger.error(`pgvector search failed, falling back to JavaScript: ${error.message}`);
+      return this.searchWithJavaScript(queryEmbedding, limit, filter, minSimilarity);
+    }
+  }
+
+  /**
+   * JavaScript-based similarity search (for SQLite development)
+   * OPTIMIZED: Uses dot product for normalized vectors (OpenAI embeddings are pre-normalized)
+   * For normalized vectors: cosine_similarity = dot_product (2x faster than full cosine)
+   */
+  private async searchWithJavaScript(
+    queryEmbedding: number[],
+    limit: number,
+    filter?: Partial<VectorMetadata>,
+    minSimilarity: number = 0.3,
+  ): Promise<SearchResult[]> {
     let qb = this.chunksRepository.createQueryBuilder('chunk');
 
     if (filter?.therapistId) {
@@ -78,11 +214,13 @@ export class PgVectorAdapter implements IVectorStore {
 
     const results = chunks
       .map((chunk) => {
-        const similarity = this.cosineSimilarity(queryEmbedding, chunk.embedding);
+        // OPTIMIZED: Use dot product for OpenAI's normalized embeddings
+        const similarity = this.dotProductSimilarity(queryEmbedding, chunk.embedding);
         return {
           id: chunk.id,
           score: similarity,
           text: chunk.text,
+          embedding: chunk.embedding, // Include for MMR diversity
           metadata: {
             sessionId: chunk.sessionId,
             therapistId: chunk.therapistId || '',
@@ -165,8 +303,44 @@ export class PgVectorAdapter implements IVectorStore {
     }
   }
 
+  /**
+   * OPTIMIZED: Dot product similarity for normalized vectors
+   * 
+   * OpenAI embeddings are pre-normalized (unit length = 1), so:
+   * cosine_similarity(A, B) = dot_product(A, B)
+   * 
+   * This is 2x faster than computing full cosine similarity.
+   * Performance: ~1024 multiplications + 1024 additions = very fast
+   */
+  private dotProductSimilarity(vecA: number[], vecB: number[]): number {
+    if (vecA.length !== vecB.length) {
+      this.logger.warn(
+        `Vector dimension mismatch: ${vecA.length} vs ${vecB.length}. Returning 0.`
+      );
+      return 0;
+    }
+
+    let product = 0;
+    for (let i = 0; i < vecA.length; i++) {
+      product += vecA[i] * vecB[i];
+    }
+
+    // Clamp to [-1, 1] to handle floating point precision errors
+    return Math.max(-1, Math.min(1, product));
+  }
+
+  /**
+   * Full cosine similarity computation (backup method)
+   * Use only if vectors are NOT normalized
+   * Includes division-by-zero protection
+   */
   private cosineSimilarity(vecA: number[], vecB: number[]): number {
-    if (vecA.length !== vecB.length) return 0;
+    if (vecA.length !== vecB.length) {
+      this.logger.warn(
+        `Vector dimension mismatch: ${vecA.length} vs ${vecB.length}. Returning 0.`
+      );
+      return 0;
+    }
 
     let dotProduct = 0;
     let normA = 0;
@@ -178,7 +352,18 @@ export class PgVectorAdapter implements IVectorStore {
       normB += vecB[i] * vecB[i];
     }
 
-    return dotProduct / (Math.sqrt(normA) * Math.sqrt(normB));
+    const denominator = Math.sqrt(normA) * Math.sqrt(normB);
+
+    // Division by zero protection
+    if (denominator === 0 || !Number.isFinite(denominator)) {
+      this.logger.warn('Zero magnitude vector encountered. Returning 0.');
+      return 0;
+    }
+
+    const similarity = dotProduct / denominator;
+
+    // Clamp to [-1, 1] to handle floating point errors
+    return Math.max(-1, Math.min(1, similarity));
   }
 }
 

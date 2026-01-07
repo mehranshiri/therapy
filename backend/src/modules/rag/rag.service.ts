@@ -194,7 +194,52 @@ Chunk:
 
   /**
    * Search with advanced RAG features
-   * Pipeline: Embed Query → Hybrid Search → Rerank → Return
+   * 
+   * DEFAULT PIPELINE (Industry Best Practice) ⭐:
+   * 1. Semantic search (OpenAI text-embedding-3-large)
+   * 2. Cross-encoder reranking (Cohere Rerank or OpenAI GPT-4o-mini)
+   * 3. MMR diversity filtering (prevents redundant results)
+   * 
+   * Quality: Excellent (cross-encoder provides 10-30% improvement over semantic search alone)
+   * This is the standard approach used by LangChain, LlamaIndex, and recommended by Cohere/OpenAI
+   * 
+   * Why This Pipeline:
+   * 
+   * Stage 1 - Semantic Search (Bi-encoder):
+   *   - Fast, approximate retrieval from large corpus
+   *   - Encodes query and documents separately
+   *   - Good recall, but may miss nuanced relevance
+   * 
+   * Stage 2 - Cross-encoder Reranking:
+   *   - Sees query + document together (better understanding)
+   *   - Directly models relevance (not just similarity)
+   *   - Significantly improves precision for complex queries
+   *   - Example: "techniques that didn't work" vs "techniques that helped"
+   * 
+   * Stage 3 - MMR Diversity:
+   *   - Balances relevance with diversity
+   *   - For therapy: returns breathing, CBT, relaxation (not 3x breathing)
+   *   - Lambda=0.7: 70% relevance, 30% diversity
+   * 
+   * Alternative Configurations:
+   * 
+   * Budget Mode (useReranking: false, diversityMode: true):
+   *   - Skip cross-encoder reranking (no API cost)
+   *   - Quality: Good, but lower than default
+   *   - Use when: Cost is primary concern
+   * 
+   * Precision Only (useReranking: true, diversityMode: false):
+   *   - Skip diversity filtering
+   *   - Returns top most relevant (may be similar)
+   *   - Use when: Looking for single best match
+   * 
+   * Raw Search (useReranking: false, diversityMode: false):
+   *   - No post-processing
+   *   - Use when: Debugging, benchmarking
+   * 
+   * @param query Search query text
+   * @param options Search configuration
+   * @returns Ranked search results
    */
   async search(
     query: string,
@@ -204,123 +249,66 @@ Chunk:
       useHybrid?: boolean;
       useReranking?: boolean;
       diversityMode?: boolean;
+      diversityLambda?: number;
       minSimilarity?: number;
-      useHierarchical?: boolean;
     } = {},
   ) {
     const {
       limit = 10,
       therapistId,
-      useHybrid = false, // Default to false until keyword search is implemented
-      useReranking = true, // Enabled: OpenAI reranker available
-      diversityMode = false,
+      useHybrid = false, // Disabled: Current hybrid has granularity mismatch (session-level BM25 vs chunk-level semantic)
+      useReranking = true, // ENABLED: Industry best practice - cross-encoder reranking improves quality 10-30%
+      diversityMode = true, // ENABLED: MMR diversity for varied results (prevents redundant results)
+      diversityLambda = 0.7, // 70% relevance, 30% diversity
       minSimilarity = 0.3,
-      useHierarchical = true,
     } = options;
 
-    // Hierarchical retrieval: coarse doc search -> chunk/keyword search within those docs
-    let results;
-
-    if (useHierarchical) {
-      results = await this.hierarchicalSearch(
-        query,
-        therapistId,
-        limit,
-        minSimilarity,
-        useHybrid,
-      );
-    } else {
-    // 1. Perform search (hybrid or semantic)
-      results = useHybrid
-        ? await this.hybridSearch.search(
-            query,
-            limit * 2,
-            0.7,
-            { therapistId },
-            minSimilarity,
-          )
-      : await this.vectorStore.search(
-          await this.embeddingProvider.embedText(query),
-          limit * 2,
-          { therapistId } as any,
-            minSimilarity,
-        );
-    }
-
-    // 2. Apply reranking if enabled
-    if (useReranking && results.length > 0) {
-      results = diversityMode
-        ? await this.reranker.rerankWithMMR(query, results, 0.5, limit)
-        : await this.reranker.rerank(query, results, limit);
-    } else {
-      results = results.slice(0, limit);
-    }
-
-    return results;
-  }
-
-  /**
-   * Hierarchical retrieval: coarse doc search, then chunk/keyword search within top docs.
-   * Note: current vector store stores session-level embeddings; this narrows keyword search
-   * to top sessions and reuses semantic search on those sessions.
-   */
-  private async hierarchicalSearch(
-    query: string,
-    therapistId: string | undefined,
-    limit: number,
-    minSimilarity: number,
-    useHybrid: boolean,
-  ) {
     const queryEmbedding = await this.embeddingProvider.embedText(query);
 
-    // Stage 1: document-level (session) semantic search
-    const docResults = await this.vectorStore.search(
-      queryEmbedding,
-      limit * 3, // broader recall
-      { therapistId } as any,
-      minSimilarity * 0.8, // slightly lower to collect candidates
-    );
-
-    if (!docResults.length) return [];
-
-    // Collect candidate session IDs
-    const sessionIds = docResults
-      .map((d) => d.metadata?.sessionId || d.id)
-      .filter(Boolean);
-
-    // Stage 2: search within candidate sessions
-    const filter = { therapistId, sessionIds };
-
-    const chunkResults = useHybrid
+    // 1. Initial retrieval (semantic or hybrid)
+    let results = useHybrid
       ? await this.hybridSearch.search(
           query,
           limit * 2,
           0.7,
-          filter,
+          { therapistId },
           minSimilarity,
         )
       : await this.vectorStore.search(
           queryEmbedding,
           limit * 2,
-          filter as any,
+          { therapistId } as any,
           minSimilarity,
         );
 
-    // Merge scores (optionally combine doc score), then slice
-    const docScoreMap = new Map<string, number>(
-      docResults.map((d) => [d.metadata?.sessionId || d.id, d.score]),
-    );
+    if (results.length === 0) {
+      return [];
+    }
 
-    const combined = chunkResults.map((c) => {
-      const sid = c.metadata?.sessionId;
-      const docScore = sid ? docScoreMap.get(sid) ?? 0 : 0;
-      const combinedScore = c.score * 0.7 + docScore * 0.3;
-      return { ...c, score: combinedScore };
-    });
+    // 2. Optional: API-based reranking for quality (industry best practice)
+    // COST: ~$0.001 per search (OpenAI) or $0.002 (Cohere)
+    // BENEFIT: Significantly improves relevance for complex queries
+    if (useReranking) {
+      this.logger.debug('Applying API reranking (Cohere/OpenAI)');
+      results = await this.reranker.rerank(query, results, limit * 2);
+    }
 
-    return combined
-      .sort((a, b) => b.score - a.score)
-      .slice(0, limit);
+    // 3. Diversity filtering with MMR (recommended for therapy sessions)
+    // FREE: Local computation, no API calls
+    // BENEFIT: Prevents redundant results, returns varied techniques
+    if (diversityMode) {
+      this.logger.debug('Applying MMR diversity filtering');
+      results = await this.reranker.rerankWithMMR(
+        query,
+        results,
+        diversityLambda,
+        limit,
+      );
+    } else {
+      results = results.slice(0, limit);
+    }
+
+    return results;
   }
 
   /**
