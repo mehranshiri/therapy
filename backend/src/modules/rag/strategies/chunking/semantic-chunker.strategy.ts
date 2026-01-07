@@ -106,7 +106,7 @@ export class SemanticChunker implements IDocumentProcessor {
 
       // Check if adding this entry exceeds max chunk size
       if (currentTokens + entryTokens > this.maxChunkSize && currentChunk.length > 0) {
-        // Push current chunk
+        // TOO BIG! Push new chunk
         chunks.push(this.formatEntries(currentChunk));
         
         // Create overlap by keeping last few entries
