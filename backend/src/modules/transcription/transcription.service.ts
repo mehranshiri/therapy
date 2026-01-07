@@ -1,7 +1,9 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { Injectable, NotFoundException, Inject } from '@nestjs/common';
 import { SessionsService } from '../sessions/sessions.service';
 import { AiService } from '../ai/ai.service';
 import { RAGService } from '../rag/rag.service';
+import { IEmbeddingProvider } from '../rag/interfaces/embedding-provider.interface';
+import { EMBEDDING_PROVIDER } from '../rag/constants/tokens';
 
 @Injectable()
 export class TranscriptionService {
@@ -9,6 +11,8 @@ export class TranscriptionService {
     private sessionsService: SessionsService,
     private aiService: AiService,
     private ragService: RAGService,
+    @Inject(EMBEDDING_PROVIDER)
+    private readonly embeddingProvider: IEmbeddingProvider,
   ) {}
 
   /**
@@ -75,7 +79,7 @@ export class TranscriptionService {
     }
 
     // Generate embedding from summary (keep for backward compatibility)
-    const embedding = await this.aiService.generateEmbedding(summaryText);
+    const embedding = await this.embeddingProvider.embedText(summaryText);
 
     // Store embedding in session (for backward compatibility)
     await this.sessionsService.updateSession(sessionId, {

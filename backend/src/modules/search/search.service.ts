@@ -23,12 +23,13 @@ export class SearchService {
     therapistId?: string,
     limit: number = 10,
   ) {
-    // Use RAGService for advanced search (semantic search + reranking)
+    // Use RAGService for advanced search (semantic + reranking + diversity)
     const ragResults = await this.ragService.search(query, {
       limit: limit * 2, // Get more results to account for multiple chunks per session
       therapistId,
-      useHybrid: true, // enable hybrid (semantic + keyword/BM25)
-      useReranking: true, // enabled: OpenAI reranker available
+      useHybrid: false, // Disabled: Current hybrid has granularity mismatch (session-level BM25 vs chunk-level semantic)
+      useReranking: true, // ENABLED: Industry best practice - cross-encoder significantly improves relevance
+      diversityMode: true, // ENABLED: MMR diversity filtering prevents redundant results
       minSimilarity: 0.3,
     });
 

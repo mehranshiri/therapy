@@ -1,4 +1,4 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { Injectable, NotFoundException, Inject } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { Session } from './entities/session.entity';
@@ -7,6 +7,8 @@ import { CreateSessionDto } from './dto/create-session.dto';
 import { AddEntryDto } from './dto/add-entry.dto';
 import { AiService } from '../ai/ai.service';
 import { RAGService } from '../rag/rag.service';
+import { IEmbeddingProvider } from '../rag/interfaces/embedding-provider.interface';
+import { EMBEDDING_PROVIDER } from '../rag/constants/tokens';
 
 @Injectable()
 export class SessionsService {
@@ -17,6 +19,8 @@ export class SessionsService {
     private entriesRepository: Repository<SessionEntry>,
     private aiService: AiService,
     private ragService: RAGService,
+    @Inject(EMBEDDING_PROVIDER)
+    private readonly embeddingProvider: IEmbeddingProvider,
   ) {}
 
   async create(createSessionDto: CreateSessionDto): Promise<Session> {
@@ -87,7 +91,7 @@ export class SessionsService {
     const summary = await this.aiService.generateSummary(session.entries);
     
     // Generate embedding from summary (keep for backward compatibility)
-    const embedding = await this.aiService.generateEmbedding(summary);
+    const embedding = await this.embeddingProvider.embedText(summary);
     
     // Update session
     await this.sessionsRepository.update(sessionId, {
