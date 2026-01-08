@@ -269,13 +269,13 @@ JSON array of indices (most relevant first):
     ]);
 
     return text
-      .toLowerCase()
-      .split(/\s+/)
-      .map((word) => word.replace(/[^\w]/g, '')) // Remove punctuation
-      .filter(
-        (word) =>
-          word.length >= MIN_WORD_LENGTH && !STOP_WORDS.has(word),
-      );
+        .toLowerCase()
+        .split(/\s+/)
+        .map((word) => word.replace(/[^\w]/g, '')) // Remove punctuation
+        .filter(
+          (word) =>
+            word.length >= MIN_WORD_LENGTH && !STOP_WORDS.has(word),
+    );
   }
 
   /**
@@ -436,7 +436,7 @@ JSON array of indices (most relevant first):
     
     for (const word of words) {
       tf.set(word, (tf.get(word) || 0) + 1);
-    }
+  }
     
     return tf;
   }
