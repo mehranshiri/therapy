@@ -562,23 +562,6 @@ Check that:
 
 MIT
 
-## 👥 Author
-
-Senior Engineer Take-Home Assessment
-
-## 🙏 Acknowledgments
-
-- NestJS framework
-- Next.js by Vercel
-- TypeORM for database abstraction
-- OpenAI for AI capabilities (when configured)
-
----
-
-## ✅ Assessment Checklist
-
-This implementation covers all requirements:
-
 ### Core Requirements
 - ✅ NestJS backend with TypeScript
 - ✅ SQLite database with TypeORM
